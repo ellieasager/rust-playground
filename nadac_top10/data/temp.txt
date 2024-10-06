@@ -1,0 +1,618 @@
+use std::{
+    fmt::{self, Display, Formatter},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Instant, SystemTime},
+};
+
+use anyhow::{anyhow, Error};
+use csv::{ReaderBuilder, Trim};
+use rust_decimal::prelude::*;
+use serde::Deserialize;
+use tokio::{sync::RwLock, task::futures};
+
+const DOCUMENT_URL: &str = "https://download.medicaid.gov/data/nadac-comparison-04-17-2024.csv";
+const DEFAULT_YEAR: &str = "2023";
+const NUM_OF_RECORDS: usize = 10;
+const PRECISION: u32 = 2;
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct Record {
+    #[serde(rename(deserialize = "NDC Description"))]
+    description: String,
+    #[serde(rename(deserialize = "NDC"))]
+    ndc: String,
+    #[serde(rename(deserialize = "Old NADAC Per Unit"))]
+    price_old: Decimal,
+    #[serde(rename(deserialize = "New NADAC Per Unit"))]
+    price_new: Decimal,
+    #[serde(rename(deserialize = "Classification for Rate Setting"))]
+    classification: String,
+    #[serde(rename(deserialize = "Percent Change"))]
+    percent_change: String,
+    #[serde(rename(deserialize = "Primary Reason"))]
+    reason: String,
+    #[serde(rename(deserialize = "Start Date"))]
+    start_date: String,
+    #[serde(rename(deserialize = "End Date"))]
+    end_date: String,
+    #[serde(rename(deserialize = "Effective Date"))]
+    effective_date: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ReportRow {
+    description: String,
+    price_change: Decimal,
+}
+
+impl From<&Record> for ReportRow {
+    fn from(rec: &Record) -> Self {
+        ReportRow {
+            description: rec.description.clone(),
+            price_change: rec.price_new - rec.price_old,
+        }
+    }
+}
+
+impl Display for ReportRow {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut price = self.price_change;
+        price.rescale(PRECISION);
+        let price_str = if price.is_sign_negative() {
+            format!("-${}", price.abs())
+        } else {
+            format!("${}", price)
+        };
+        write!(f, "{}: {}\n", price_str, self.description)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeOfEntries {
+    HIGH,
+    LOW,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LimitedVector {
+    type_of_entries: TypeOfEntries,
+    entries: Vec<ReportRow>,
+}
+
+impl LimitedVector {
+    fn needs_update(&self, row: ReportRow) -> bool {
+        if self.entries.len() < NUM_OF_RECORDS {
+            true
+        } else {
+            match self.type_of_entries {
+                TypeOfEntries::HIGH => {
+                    self.entries.first().unwrap().price_change < row.price_change
+                        && !self.entries.contains(&row)
+                }
+                TypeOfEntries::LOW => {
+                    self.entries.last().unwrap().price_change > row.price_change
+                        && !self.entries.contains(&row)
+                }
+            }
+        }
+    }
+
+    fn add_record(&mut self, row: ReportRow) {
+        if self.entries.len() < NUM_OF_RECORDS {
+            self.entries.push(row);
+        } else {
+            match self.type_of_entries {
+                TypeOfEntries::HIGH => {
+                    if self.entries.first().unwrap().price_change < row.price_change
+                        && !self.entries.contains(&row)
+                    {
+                        self.entries.remove(0);
+                        self.entries.push(row);
+                    } else {
+                        return;
+                    }
+                }
+                TypeOfEntries::LOW => {
+                    if self.entries.last().unwrap().price_change > row.price_change
+                        && !self.entries.contains(&row)
+                    {
+                        self.entries.remove(NUM_OF_RECORDS - 1);
+                        self.entries.push(row);
+                    } else {
+                        return;
+                    }
+                }
+            }
+        }
+        self.entries
+            .sort_by(|a, b| a.price_change.cmp(&b.price_change));
+    }
+}
+
+impl Display for LimitedVector {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.type_of_entries {
+            TypeOfEntries::HIGH => {
+                let records: Vec<String> = self
+                    .entries
+                    .iter()
+                    .rev()
+                    .map(|entry| format!("{}", entry))
+                    .collect();
+                write!(f, "{}", records.join(""))
+            }
+            TypeOfEntries::LOW => {
+                let records: Vec<String> = self
+                    .entries
+                    .iter()
+                    .map(|entry| format!("{}", entry))
+                    .collect();
+                write!(f, "{}", records.join(""))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Report {
+    year: String,
+    top: Arc<RwLock<LimitedVector>>,
+    bottom: Arc<RwLock<LimitedVector>>,
+}
+
+impl Report {
+    fn new(report_year: String) -> Self {
+        Report {
+            year: report_year,
+            top: Arc::new(RwLock::new(LimitedVector {
+                type_of_entries: TypeOfEntries::HIGH,
+                entries: Vec::new(),
+            })),
+            bottom: Arc::new(RwLock::new(LimitedVector {
+                type_of_entries: TypeOfEntries::LOW,
+                entries: Vec::new(),
+            })),
+        }
+    }
+
+    async fn report_to_string(&self) -> String {
+        println!();
+        let top_title = format!(
+            "Top {} NADAC per unit price increases of {}:\n",
+            NUM_OF_RECORDS, self.year
+        );
+        let bottom_title = format!(
+            "Top {} NADAC per unit price decreases of {}:\n",
+            NUM_OF_RECORDS, self.year
+        );
+
+        format!(
+            "{top_title}{}\n{bottom_title}{}",
+            self.top.read().await,
+            self.bottom.read().await
+        )
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    if let Ok(report) = run_report(DEFAULT_YEAR).await {
+        let result = report.report_to_string().await;
+        println!("{}", result);
+    }
+    Ok(())
+}
+
+async fn run_report(year: &str) -> Result<Report, Error> {
+    // let mut handles = vec![];
+    let start_time = Instant::now();
+    let report = Report::new(year.to_string());
+
+    // handles.push(tokio::spawn(async move { process_records(&report_c); }));
+
+    // let t1 = tokio::spawn(async move {
+    //     // // While main has an active read lock, we acquire one too.
+    //     // let r = c_lock.read().await;
+    //     // assert_eq!(*r, 1);
+    //     _= process_records(&report_c).await;
+    // }).await;
+
+    _ = tokio::join!(process_records(&report));
+    // tokio::task::JoinHandle(handles).await;
+
+    // thread::sleep(time::Duration::from_secs(3));
+    let duration = start_time.elapsed();
+    println!("time elapsed: {:?}", duration);
+    Ok(report)
+}
+
+async fn process_records(report: &Report) -> Result<(), Error> {
+    let mut response = reqwest::get(DOCUMENT_URL).await?;
+    let mut is_first_iteration = true;
+    let mut section_to_process;
+    let mut remainder_of_previous_section = String::new();
+    while let Some(chunk) = response.chunk().await? {
+        let s = String::from_utf8_lossy(&chunk);
+        // find the last occurence of the EOL char
+        let parse_to_here = s.rfind('\n').unwrap();
+        let parse_this = s.get(0..parse_to_here).unwrap();
+        section_to_process = String::new();
+        section_to_process.push_str(&remainder_of_previous_section.clone());
+        section_to_process.push_str(&parse_this);
+
+        process_record(section_to_process, is_first_iteration, &report).await;
+        remainder_of_previous_section = s.get(parse_to_here + 1..).unwrap().to_string();
+        // println!("REMAINDER: {section:?}");
+        is_first_iteration = false;
+    }
+    Ok(())
+}
+
+async fn process_record(section: String, has_headers: bool, report: &Report) {
+    // println!("CURRENT SECTION");
+    // println!("{section}");
+    // println!("CURRENT SECTION");
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(has_headers)
+        .trim(Trim::All)
+        .from_reader(section.as_bytes());
+    for result in rdr.deserialize::<Record>() {
+        match result {
+            Ok(record) => {
+                if record.effective_date.ends_with(report.year.as_str()) {
+                    let report_row = ReportRow::from(&record);
+
+                    if report.top.read().await.needs_update(report_row.clone()) {
+                        report.top.write().await.add_record(report_row.clone());
+                    }
+                    if report.bottom.read().await.needs_update(report_row.clone()) {
+                        report.bottom.write().await.add_record(report_row.clone());
+                    }
+                    // println!("{:?}", report_row)
+                }
+            }
+            Err(e) => {
+                println!("ERROR: {:?}", e);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn test_ok() {
+        let report_year = "2020";
+        let expected_output: String = fs::read_to_string("./data/top_10_2020.txt").unwrap();
+
+        let report = run_report(report_year).await.unwrap();
+        let output = report.report_to_string().await;
+
+        assert_eq!(expected_output, output);
+    }
+
+    #[tokio::test]
+    async fn test_no_data() {
+        let report_year = "1955"; // some year likely not in the data file
+        let report = run_report(report_year).await.unwrap();
+
+        assert_eq!(report_year, report.year);
+        assert!(report.top.read().await.entries.is_empty());
+        assert!(report.bottom.read().await.entries.is_empty());
+    }
+}
+
+
+
+------
+
+
+use std::{
+    fmt::{self, Display, Formatter},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Instant, SystemTime},
+};
+
+use anyhow::{anyhow, Error};
+use csv::{ReaderBuilder, Trim};
+use rust_decimal::prelude::*;
+use serde::Deserialize;
+use tokio::{sync::RwLock, task::futures};
+
+const DOCUMENT_URL: &str = "https://download.medicaid.gov/data/nadac-comparison-04-17-2024.csv";
+const DEFAULT_YEAR: &str = "2023";
+const NUM_OF_RECORDS: usize = 10;
+const PRECISION: u32 = 2;
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct Record {
+    #[serde(rename(deserialize = "NDC Description"))]
+    description: String,
+    #[serde(rename(deserialize = "NDC"))]
+    ndc: String,
+    #[serde(rename(deserialize = "Old NADAC Per Unit"))]
+    price_old: Decimal,
+    #[serde(rename(deserialize = "New NADAC Per Unit"))]
+    price_new: Decimal,
+    #[serde(rename(deserialize = "Classification for Rate Setting"))]
+    classification: String,
+    #[serde(rename(deserialize = "Percent Change"))]
+    percent_change: String,
+    #[serde(rename(deserialize = "Primary Reason"))]
+    reason: String,
+    #[serde(rename(deserialize = "Start Date"))]
+    start_date: String,
+    #[serde(rename(deserialize = "End Date"))]
+    end_date: String,
+    #[serde(rename(deserialize = "Effective Date"))]
+    effective_date: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct ReportRow {
+    description: String,
+    price_change: Decimal,
+}
+
+impl From<&Record> for ReportRow {
+    fn from(rec: &Record) -> Self {
+        ReportRow {
+            description: rec.description.clone(),
+            price_change: rec.price_new - rec.price_old,
+        }
+    }
+}
+
+impl Display for ReportRow {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut price = self.price_change;
+        price.rescale(PRECISION);
+        let price_str = if price.is_sign_negative() {
+            format!("-${}", price.abs())
+        } else {
+            format!("${}", price)
+        };
+        write!(f, "{}: {}\n", price_str, self.description)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TypeOfEntries {
+    HIGH,
+    LOW,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LimitedVector {
+    type_of_entries: TypeOfEntries,
+    entries: Vec<ReportRow>,
+}
+
+impl LimitedVector {
+    fn needs_update(&self, row: ReportRow) -> bool {
+        if self.entries.len() < NUM_OF_RECORDS {
+            true
+        } else {
+            match self.type_of_entries {
+                TypeOfEntries::HIGH => {
+                    self.entries.first().unwrap().price_change < row.price_change
+                        && !self.entries.contains(&row)
+                }
+                TypeOfEntries::LOW => {
+                    self.entries.last().unwrap().price_change > row.price_change
+                        && !self.entries.contains(&row)
+                }
+            }
+        }
+    }
+
+    fn add_record(&mut self, row: ReportRow) {
+        if self.entries.len() < NUM_OF_RECORDS {
+            self.entries.push(row);
+        } else {
+            match self.type_of_entries {
+                TypeOfEntries::HIGH => {
+                    if self.entries.first().unwrap().price_change < row.price_change
+                        && !self.entries.contains(&row)
+                    {
+                        self.entries.remove(0);
+                        self.entries.push(row);
+                    } else {
+                        return;
+                    }
+                }
+                TypeOfEntries::LOW => {
+                    if self.entries.last().unwrap().price_change > row.price_change
+                        && !self.entries.contains(&row)
+                    {
+                        self.entries.remove(NUM_OF_RECORDS - 1);
+                        self.entries.push(row);
+                    } else {
+                        return;
+                    }
+                }
+            }
+        }
+        self.entries
+            .sort_by(|a, b| a.price_change.cmp(&b.price_change));
+    }
+}
+
+impl Display for LimitedVector {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self.type_of_entries {
+            TypeOfEntries::HIGH => {
+                let records: Vec<String> = self
+                    .entries
+                    .iter()
+                    .rev()
+                    .map(|entry| format!("{}", entry))
+                    .collect();
+                write!(f, "{}", records.join(""))
+            }
+            TypeOfEntries::LOW => {
+                let records: Vec<String> = self
+                    .entries
+                    .iter()
+                    .map(|entry| format!("{}", entry))
+                    .collect();
+                write!(f, "{}", records.join(""))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Report {
+    year: String,
+    top: Arc<RwLock<LimitedVector>>,
+    bottom: Arc<RwLock<LimitedVector>>,
+}
+
+impl Report {
+    fn new(report_year: String) -> Self {
+        Report {
+            year: report_year,
+            top: Arc::new(RwLock::new(LimitedVector {
+                type_of_entries: TypeOfEntries::HIGH,
+                entries: Vec::new(),
+            })),
+            bottom: Arc::new(RwLock::new(LimitedVector {
+                type_of_entries: TypeOfEntries::LOW,
+                entries: Vec::new(),
+            })),
+        }
+    }
+
+    async fn report_to_string(&self) -> String {
+        println!();
+        let top_title = format!(
+            "Top {} NADAC per unit price increases of {}:\n",
+            NUM_OF_RECORDS, self.year
+        );
+        let bottom_title = format!(
+            "Top {} NADAC per unit price decreases of {}:\n",
+            NUM_OF_RECORDS, self.year
+        );
+
+        format!(
+            "{top_title}{}\n{bottom_title}{}",
+            self.top.read().await,
+            self.bottom.read().await
+        )
+    }
+}
+
+// #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    if let Ok(report) = run_report(DEFAULT_YEAR).await {
+        let result = report.report_to_string().await;
+        println!("{}", result);
+    }
+    Ok(())
+}
+
+async fn run_report(year: &str) -> Result<Report, Error> {
+    let start_time = Instant::now();
+    let report = Report::new(year.to_string());
+    
+    // let mut handles = vec![];
+    // handles.push(tokio::spawn(async move { process_records(&report_c); }));
+
+    // let t1 = tokio::spawn(async move {
+    //     // // While main has an active read lock, we acquire one too.
+    //     // let r = c_lock.read().await;
+    //     // assert_eq!(*r, 1);
+    //     _= process_records(&report_c).await;
+    // }).await;
+    // tokio::task::JoinHandle(handles).await;
+
+    _ = tokio::join!(process_data(&report));
+
+    let duration = start_time.elapsed();
+    println!("time elapsed: {:?}", duration);
+    Ok(report)
+}
+
+async fn process_data(report: &Report) -> Result<(), Error> {
+    let mut response = reqwest::get(DOCUMENT_URL).await?;
+    let mut is_first_iteration = true;
+    let mut section = String::new();
+    while let Some(chunk) = response.chunk().await? {
+        let s = String::from_utf8_lossy(&chunk);
+        let parse_to_here = s.rfind('\n').unwrap();
+        let parse_this = s.get(0..parse_to_here).unwrap();
+        section.push_str(parse_this);
+
+        process_records(section, is_first_iteration, &report).await;
+        section = s.get(parse_to_here + 1..).unwrap().to_string();
+        // println!("REMAINDER: {section:?}");
+        is_first_iteration = false;
+    }
+    Ok(())
+}
+
+async fn process_records(section: String, has_headers: bool, report: &Report) {
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(has_headers)
+        .trim(Trim::All)
+        .from_reader(section.as_bytes());
+    for result in rdr.deserialize::<Record>() {
+        match result {
+            Ok(record) => {
+                process_record(record, report).await;
+            }
+            Err(e) => {
+                println!("ERROR: {:?}", e);
+            }
+        }
+    }
+}
+
+async fn process_record(record: Record, report: &Report) {
+    if record.effective_date.ends_with(report.year.as_str()) {
+        let report_row = ReportRow::from(&record);
+
+        if report.top.read().await.needs_update(report_row.clone()) {
+            report.top.write().await.add_record(report_row.clone());
+        }
+        if report.bottom.read().await.needs_update(report_row.clone()) {
+            report.bottom.write().await.add_record(report_row.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use std::fs;
+
+    #[tokio::test]
+    async fn test_ok() {
+        let report_year = "2020";
+        let expected_output: String = fs::read_to_string("./data/top_10_2020.txt").unwrap();
+
+        let report = run_report(report_year).await.unwrap();
+        let output = report.report_to_string().await;
+
+        assert_eq!(expected_output, output);
+    }
+
+    #[tokio::test]
+    async fn test_no_data() {
+        let report_year = "1955"; // some year likely not in the data file
+        let report = run_report(report_year).await.unwrap();
+
+        assert_eq!(report_year, report.year);
+        assert!(report.top.read().await.entries.is_empty());
+        assert!(report.bottom.read().await.entries.is_empty());
+    }
+}
