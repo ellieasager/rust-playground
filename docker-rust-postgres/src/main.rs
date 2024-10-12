@@ -23,7 +23,7 @@ async fn list_users(pool: web::Data<Pool>) -> HttpResponse {
 }
 
 fn address() -> String {
-    std::env::var("ADDRESS").unwrap_or_else(|_| "127.0.0.1:8000".into())
+    std::env::var("ADDRESS").unwrap_or_else(|_| "127.0.0.1:8080".into())
 }
 
 #[actix_web::main]
