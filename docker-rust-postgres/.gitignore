@@ -1,0 +1,5 @@
+target
+compose.yaml
+Dockerfile
+/db
+.dockerignore
